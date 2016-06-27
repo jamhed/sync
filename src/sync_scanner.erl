@@ -25,7 +25,8 @@
     set_growl/1,
     get_growl/0,
     set_log/1,
-    get_log/0
+    get_log/0,
+    build_include_map/0
 ]).
 
 -define(SERVER, ?MODULE).
@@ -44,6 +45,7 @@
     beam_lastmod = undefined :: [{module(), timestamp()}],
     src_file_lastmod = [] :: [{file:filename(), timestamp()}],
     hrl_file_lastmod = [] :: [{file:filename(), timestamp()}],
+    include_map = [],
     timers = [],
     patching = false,
     paused = false
@@ -103,6 +105,8 @@ set_log(F) when ?LOG_OR_GROWL_OFF(F) ->
 get_log() ->
     sync_utils:get_env(log, all).
 
+build_include_map() ->
+    gen_server:cast(?SERVER, build_include_map).
 
 enable_patching() ->
     gen_server:cast(?SERVER, enable_patching),
@@ -222,7 +226,7 @@ handle_cast(compare_hrl_files, State) ->
     NewHrlFileLastMod = lists:usort([F(X) || X <- State#state.hrl_files]),
 
     %% Compare to previous results, if there are changes, then recompile src files that depends
-    process_hrl_file_lastmod(State#state.hrl_file_lastmod, NewHrlFileLastMod, State#state.src_files, State#state.patching),
+    process_hrl_file_lastmod(State#state.hrl_file_lastmod, NewHrlFileLastMod, State#state.include_map, State#state.patching),
 
     %% Schedule the next interval...
     NewTimers = schedule_cast(compare_hrl_files, 2000, State#state.timers),
@@ -235,7 +239,17 @@ handle_cast(info, State) ->
     io:format("Modules: ~p~n", [State#state.modules]),
     io:format("Source Dirs: ~p~n", [State#state.src_dirs]),
     io:format("Source Files: ~p~n", [State#state.src_files]),
+    io:format("Include Map: ~p~n", [State#state.include_map]),
     {noreply, State};
+
+handle_cast(build_include_map, State=#state{src_files=SrcFiles}) ->
+    Includes = include_map(SrcFiles),
+    IncludeMap = lists:foldl(
+        fun({SrcFile, IncludeFiles}, Acc) ->
+            [ {IncludeFile, SrcFile} || IncludeFile <- IncludeFiles ] ++ Acc
+        end,
+        [], Includes),
+    {noreply, State#state{include_map=IncludeMap}};
 
 handle_cast(enable_patching, State) ->
     NewState = State#state { patching = true },
@@ -626,39 +640,26 @@ growl_format_errors(Errors, Warnings) ->
     end,
     [F(X) || X <- Everything].
 
-process_hrl_file_lastmod([{File, LastMod}|T1], [{File, LastMod}|T2], SrcFiles, Patching) ->
+process_hrl_file_lastmod([{File, LastMod}|T1], [{File, LastMod}|T2], IncludeMap, Patching) ->
     %% Hrl hasn't changed, do nothing...
-    process_hrl_file_lastmod(T1, T2, SrcFiles, Patching);
-process_hrl_file_lastmod([{File, _}|T1], [{File, _}|T2], SrcFiles, Patching) ->
+    process_hrl_file_lastmod(T1, T2, IncludeMap, Patching);
+process_hrl_file_lastmod([{File, _}|T1], [{File, _}|T2], IncludeMap, Patching) ->
     %% File has changed, recompile...
-    WhoInclude = who_include(File, SrcFiles),
-    [recompile_src_file(SrcFile, Patching) || SrcFile <- WhoInclude],
-    process_hrl_file_lastmod(T1, T2, SrcFiles, Patching);
-process_hrl_file_lastmod([{File1, LastMod1}|T1], [{File2, LastMod2}|T2], SrcFiles, Patching) ->
+    %% FIXME: we need to map file to module instead of basename
+    BaseName = filename:basename(File),
+    [recompile_src_file(SrcFile, Patching) || SrcFile <- proplists:get_all_values(BaseName, IncludeMap)],
+    process_hrl_file_lastmod(T1, T2, IncludeMap, Patching);
+process_hrl_file_lastmod([{File1, LastMod1}|T1], [{File2, LastMod2}|T2], IncludeMap, Patching) ->
     %% Lists are different...
+    %% FIXME: rebuild include map once, recompile (if needed)
     case File1 < File2 of
         true ->
-            %% File was removed, do nothing...
-            WhoInclude = who_include(File1, SrcFiles),
-            case WhoInclude of
-                [] -> ok;
-                _ -> io:format(
-                        "Warning. Deleted ~p file included in existing src files: ~p",
-                        [filename:basename(File1), lists:map(fun(File) -> filename:basename(File) end, WhoInclude)])
-            end,
-            process_hrl_file_lastmod(T1, [{File2, LastMod2}|T2], SrcFiles, Patching);
+            process_hrl_file_lastmod(T1, [{File2, LastMod2}|T2], IncludeMap, Patching);
         false ->
-            %% File is new, look for src that include it
-            WhoInclude = who_include(File2, SrcFiles),
-            [maybe_recompile_src_file(SrcFile, LastMod2, Patching) || SrcFile <- WhoInclude],
-            process_hrl_file_lastmod([{File1, LastMod1}|T1], T2, SrcFiles, Patching)
+            process_hrl_file_lastmod([{File1, LastMod1}|T1], T2, IncludeMap, Patching)
     end;
-process_hrl_file_lastmod([], [{File, LastMod}|T2], SrcFiles, Patching) ->
-    %% FIXME!!! It's incredible, un-usable slow 
-    %% File is new, look for src that include it
-    %% WhoInclude = who_include(File, SrcFiles),
-    %% [maybe_recompile_src_file(SrcFile, LastMod, Patching) || SrcFile <- WhoInclude],
-    process_hrl_file_lastmod([], T2, SrcFiles, Patching);
+process_hrl_file_lastmod([], [{_File, _LastMod}|_T2], _IncludeMap, _Patching) ->
+    build_include_map();
 process_hrl_file_lastmod([], [], _, _) ->
     %% Done
     ok;
@@ -684,6 +685,19 @@ is_include(HrlFile, [{tree, attribute, _, {attribute, _, [{_, _, IncludeFile}]}}
     end;
 is_include(HrlFile, [_SomeForm | Forms]) ->
     is_include(HrlFile, Forms).
+
+include_map(SrcFiles) ->
+    [ include_map_file(SrcFile) || SrcFile <- SrcFiles ].
+
+include_map_file(SrcFile) ->
+    {ok, Forms} = epp_dodger:parse_file(SrcFile),
+    Includes = grep_include(Forms),
+    {SrcFile, Includes}.
+
+grep_include([]) -> [];
+grep_include([{tree, attribute, _, {attribute, _, [{_, _, IncludeFile}]}} | Forms]) when is_list(IncludeFile) ->
+    [ IncludeFile | grep_include(Forms) ];
+grep_include([_ | Forms]) -> grep_include(Forms).
 
 %% @private Filter the modules to be scanned.
 filter_modules_to_scan(Modules) ->
